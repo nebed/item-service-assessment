@@ -1,9 +1,8 @@
 """
-item-service  (base / "main" branch -- this is the version running in the cluster)
+item-service  (branch: fix/stability-issues)
 
-A small FastAPI + Postgres service. It is deployed at 3 replicas and is currently
-misbehaving in the cluster. Three problems are present in this code. They are NOT
-labelled -- diagnosing them is Phase 1 of the exercise.
+Attempts to fix the stability problems reported in the cluster.
+See PR_DESCRIPTION.md for the author's summary of changes.
 """
 import asyncio
 import logging
@@ -13,7 +12,6 @@ import uuid
 import asyncpg
 from fastapi import FastAPI, HTTPException
 
-# Logging: single INFO stream, no levels tuning, no request context.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger()
 
@@ -25,8 +23,11 @@ DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 DB_NAME = os.getenv("DB_NAME", "itemsdb")
 
-# Connection pool size. Set to a fixed value in code.
-DB_POOL_SIZE = 10
+# Fix: pool size is now configurable instead of hardcoded.
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+
+# Fix: cap the cache so it can't grow forever.
+CACHE_MAX_ITEMS = 1000
 
 _pool = None
 _cache = []
@@ -35,7 +36,9 @@ _cache = []
 @app.on_event("startup")
 async def startup():
     global _pool
-    log.info("starting up")
+    dsn = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    # Fix: log the connection target to aid debugging.
+    log.info("connecting to database: %s", dsn)
     _pool = await asyncpg.create_pool(
         host=DB_HOST,
         port=DB_PORT,
@@ -55,11 +58,14 @@ async def startup():
 
 
 async def _background_worker():
-    # Periodically refreshes an in-memory cache of recent activity.
+    global _cache
     while True:
         await asyncio.sleep(1)
         _cache.append(bytearray(512 * 1024))
-        log.info("background tick")
+        # Fix: keep only the most recent CACHE_MAX_ITEMS entries.
+        if len(_cache) > CACHE_MAX_ITEMS:
+            _cache = _cache[-CACHE_MAX_ITEMS:]
+        log.info("background tick, cache size=%s", len(_cache))
 
 
 @app.get("/health")
@@ -69,11 +75,14 @@ async def health():
 
 @app.get("/items")
 async def list_items():
-    log.info("request received")
-    log.info("processing")
+    # Fix: added more logging around the request lifecycle.
+    log.info("request received for list_items")
+    log.info("acquiring connection")
+    log.info("processing request")
     try:
         async with _pool.acquire() as conn:
             rows = await conn.fetch("SELECT id FROM items LIMIT 100")
+        log.info("query returned %s rows", len(rows))
         log.info("done")
         return {"count": len(rows)}
     except Exception as e:
@@ -83,8 +92,9 @@ async def list_items():
 
 @app.post("/items")
 async def create_item():
-    log.info("request received")
-    log.info("processing")
+    log.info("request received for create_item")
+    log.info("acquiring connection")
+    log.info("processing request")
     try:
         async with _pool.acquire() as conn:
             await conn.execute("INSERT INTO items (id) VALUES ($1)", uuid.uuid4())
